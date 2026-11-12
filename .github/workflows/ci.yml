@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run gen:api -w frontend
+      - run: npm run lint
+      - run: npm run typecheck
+      # Constitution Principle IV: no merge while any domain/contract/integration test fails.
+      - run: npm run test:domain -w backend
+      - run: npm run test:contract -w backend
+      - run: npm run test:integration -w backend
+      - run: npm run test -w frontend

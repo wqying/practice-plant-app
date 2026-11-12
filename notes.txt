@@ -1,0 +1,23 @@
+/speckit-plan
+/speckit-tasks
+/speckit-implement
+
+short constitution
+review spec before generating code
+keep all artifcacts in version control
+check tasks connect to requirement
+update the spec when decisions change
+verify prototype
+
+Speckit pros and cons:
+pros:
+- structure requirements
+- creating implementation plans
+- break work into tasks
+- guide coding agents
+- make decisions easier to review
+
+cons:
+- cannot guarantee correct stakeholder implementation
+- complete requirements
+- bug free code

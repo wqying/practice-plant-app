@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: pvh
+      POSTGRES_USER: pvh
+      POSTGRES_PASSWORD: pvh
+    ports:
+      - "5432:5432"
+    volumes:
+      - pvh-db:/var/lib/postgresql/data
+volumes:
+  pvh-db:

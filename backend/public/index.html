@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PlantsVSHumans</title>
+<style>
+  :root { --bg:#f7f5ef; --card:#fff; --ink:#1f2a1f; --muted:#5b665b; --line:#dcd8cc;
+          --green:#2f6b3a; --red:#a3261b; --amber:#8a5a00; --blue:#1f4f8a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--green); color:#fff; padding:12px 16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; flex:1; }
+  header select { font-size:15px; padding:6px; border-radius:6px; max-width:50vw; }
+  nav { display:flex; background:#fff; border-bottom:1px solid var(--line); }
+  nav button { flex:1; padding:12px; border:0; background:none; font-size:15px; min-height:44px; }
+  nav button[aria-current="page"] { font-weight:700; border-bottom:3px solid var(--green); }
+  main { max-width:720px; margin:0 auto; padding:12px 16px 80px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin:8px 0; display:flex; gap:10px; align-items:center; }
+  .card .info { flex:1; min-width:0; }
+  .card .name { font-weight:600; }
+  .muted { color:var(--muted); font-size:14px; }
+  .badge { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:999px; border:1.5px solid; margin-top:2px; }
+  .overdue { color:var(--red); } .due_today { color:var(--amber); } .upcoming { color:var(--blue); } .completed { color:var(--green); }
+  button.primary { background:var(--green); color:#fff; border:0; border-radius:8px; padding:10px 14px; font-size:15px; min-height:44px; min-width:44px; }
+  button.secondary { background:#fff; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:8px 12px; min-height:44px; }
+  button:disabled { opacity:.6; }
+  h2 { font-size:16px; margin:18px 0 4px; }
+  h2.today::after { content:" · Today"; color:var(--amber); }
+  .weeknav { display:flex; gap:8px; align-items:center; justify-content:space-between; }
+  .weeknav strong { font-size:14px; text-align:center; }
+  form.stack { display:grid; gap:10px; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; }
+  label { display:grid; gap:4px; font-size:14px; }
+  input, select, textarea { font:inherit; padding:8px; border:1px solid var(--line); border-radius:6px; width:100%; }
+  .toast { position:fixed; left:16px; right:16px; bottom:16px; max-width:688px; margin:auto; background:#222; color:#fff; padding:12px 14px; border-radius:8px; display:none; z-index:20; }
+  .toast.error { background:var(--red); }
+  dialog { border:0; border-radius:12px; max-width:92vw; width:420px; }
+  dialog::backdrop { background:rgba(0,0,0,.4); }
+  .row { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; margin-top:12px; }
+  .tag { font-size:12px; border:1px solid var(--line); border-radius:4px; padding:0 5px; margin-left:4px; }
+  .empty { color:var(--muted); font-size:14px; padding:4px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌿 <span id="hh">PlantsVSHumans</span></h1>
+  <label style="color:#fff">I am
+    <select id="who" aria-label="Who are you?"></select>
+  </label>
+</header>
+<nav>
+  <button data-tab="week" aria-current="page">This week</button>
+  <button data-tab="plants">Plants</button>
+  <button data-tab="home">Household</button>
+</nav>
+<main id="main"></main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<dialog id="dup">
+  <p id="dupmsg"></p>
+  <div class="row">
+    <button class="secondary" id="dupcancel">Cancel</button>
+    <button class="primary" id="dupok">Log anyway</button>
+  </div>
+</dialog>
+
+<dialog id="earlier">
+  <form method="dialog" class="stack" style="border:0;padding:0" id="earlierform">
+    <strong id="earliertitle">Log an earlier watering</strong>
+    <label>When <input type="datetime-local" id="earlierat" required /></label>
+    <label>Note (optional) <input id="earliernote" maxlength="280" /></label>
+    <div class="row"><button class="secondary" value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Save</button></div>
+  </form>
+</dialog>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = { tab: "week", weekStart: null, memberFilter: "", household: null, me: localStorage.getItem("pvh.me") || "" };
+
+async function api(path, opts = {}) {
+  let res;
+  try {
+    res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  } catch {
+    throw Object.assign(new Error("Not saved — you're offline. Try again when connected."), { offline: true });
+  }
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.message || "Something went wrong"), { status: res.status, data });
+  return data;
+}
+function toast(msg, error = false) {
+  const t = $("#toast"); t.textContent = msg; t.className = "toast" + (error ? " error" : ""); t.style.display = "block";
+  clearTimeout(toast.t); toast.t = setTimeout(() => (t.style.display = "none"), 4000);
+}
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtTime = (iso) => new Date(iso).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit", timeZone: state.household?.timeZone });
+const fmtDay = (d) => new Date(d + "T12:00:00Z").toLocaleDateString([], { weekday: "long", day: "numeric", month: "short", timeZone: "UTC" });
+const badge = (kind, label) => `<span class="badge ${kind}">${{ overdue: "⚠️", due_today: "⏰", upcoming: "📅", completed: "✅" }[kind] || ""} ${esc(label)}</span>`;
+const cat = (c) => `<span class="muted">${c.icon} ${esc(c.label)}</span>`;
+
+// ---------------------------------------------------------------- members
+async function loadHousehold() {
+  state.household = await api("/api/household");
+  $("#hh").textContent = state.household.name;
+  const active = state.household.members.filter((m) => m.active);
+  if (state.household.members.some((m) => m.id === state.me && !m.active)) { state.me = ""; localStorage.removeItem("pvh.me"); }
+  $("#who").innerHTML = `<option value="">— choose —</option>` +
+    active.map((m) => `<option value="${m.id}" ${m.id === state.me ? "selected" : ""}>${esc(m.name)}</option>`).join("");
+}
+$("#who").onchange = (e) => { state.me = e.target.value; localStorage.setItem("pvh.me", state.me); render(); };
+
+// ---------------------------------------------------------------- watering
+async function water(plantId, latestEventId, extra = {}) {
+  if (!state.me) { toast("Pick who you are first (top right).", true); return; }
+  const body = { memberId: state.me, knownLatestEventId: latestEventId, ...extra };
+  try {
+    await api(`/api/plants/${plantId}/water`, { method: "POST", body });
+    toast("💧 Watering logged");
+    render();
+  } catch (err) {
+    if (err.status === 409 && err.data?.code === "duplicate_warning") {
+      $("#dupmsg").textContent = err.data.message;
+      const d = $("#dup"); d.showModal();
+      $("#dupcancel").onclick = () => d.close();
+      $("#dupok").onclick = () => { d.close(); water(plantId, latestEventId, { ...extra, confirmDuplicate: true }); };
+    } else toast(err.message, true);
+  }
+}
+function waterEarlier(plantId, name, latestEventId) {
+  const d = $("#earlier"); $("#earliertitle").textContent = `Log an earlier watering — ${name}`;
+  const now = new Date(); now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+  $("#earlierat").max = now.toISOString().slice(0, 16); $("#earlierat").value = ""; $("#earliernote").value = "";
+  d.showModal();
+  d.onclose = () => {
+    if (d.returnValue !== "ok" || !$("#earlierat").value) return;
+    water(plantId, latestEventId, { performedAt: new Date($("#earlierat").value).toISOString(), note: $("#earliernote").value || undefined });
+  };
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-water]");
+  if (b) water(b.dataset.water, b.dataset.latest || null);
+  const l = e.target.closest("[data-earlier]");
+  if (l) waterEarlier(l.dataset.earlier, l.dataset.name, l.dataset.latest || null);
+});
+const waterBtns = (it) => `
+  <button class="primary" data-water="${it.plantId}" data-latest="${it.latestEventId || ""}" aria-label="Water ${esc(it.plantName)}">💧 Water</button>`;
+
+// ---------------------------------------------------------------- views
+async function renderWeek() {
+  const q = new URLSearchParams(); if (state.weekStart) q.set("weekStart", state.weekStart); if (state.memberFilter) q.set("memberId", state.memberFilter);
+  const d = await api("/api/dashboard?" + q);
+  const shift = (n) => { const x = new Date(d.weekStart + "T00:00:00Z"); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+  const item = (it) => `
+    <div class="card">
+      <div class="info">
+        <div class="name">${esc(it.plantName)} ${it.plantLocation ? `<span class="muted">· ${esc(it.plantLocation)}</span>` : ""}</div>
+        ${cat(it.category)} ${badge(it.kind, it.statusLabel)}
+        ${it.event ? `<div class="muted">by ${esc(it.event.performedBy)} · ${fmtTime(it.event.performedAt)}${it.event.isBackdated ? '<span class="tag">Backdated</span>' : ""}${it.event.isIntentionalExtra ? '<span class="tag">Extra</span>' : ""}${it.event.isPossibleDuplicate ? '<span class="tag">Possible duplicate</span>' : ""}</div>` : ""}
+      </div>
+      ${it.kind === "overdue" || it.kind === "due_today" ? waterBtns(it) : ""}
+    </div>`;
+  $("#main").innerHTML = `
+    <div class="weeknav">
+      <button class="secondary" id="prev" aria-label="Previous week">‹ Prev</button>
+      <strong>${fmtDay(d.weekStart).replace(/^\w+ /, "")} – ${fmtDay(d.weekEnd).replace(/^\w+ /, "")}</strong>
+      <button class="secondary" id="next" aria-label="Next week">Next ›</button>
+    </div>
+    <label style="margin-top:8px">Show completed by
+      <select id="mf"><option value="">Everyone</option>${d.members.map((m) => `<option value="${m.id}" ${m.id === state.memberFilter ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select>
+    </label>
+    ${d.overdue.length ? `<h2 class="overdue">⚠️ Overdue</h2>${d.overdue.map(item).join("")}` : ""}
+    ${d.days.map((day) => `<h2 class="${day.date === d.today ? "today" : ""}">${fmtDay(day.date)}</h2>
+      ${day.items.length ? day.items.map(item).join("") : `<div class="empty">Nothing scheduled</div>`}`).join("")}
+    ${!d.days.some((x) => x.items.length) && !d.overdue.length ? `<p class="muted">No plants yet — add some in the Plants tab.</p>` : ""}`;
+  $("#prev").onclick = () => { state.weekStart = shift(-7); render(); };
+  $("#next").onclick = () => { state.weekStart = shift(7); render(); };
+  $("#mf").onchange = (e) => { state.memberFilter = e.target.value; render(); };
+}
+
+async function renderPlants() {
+  const { plants } = await api("/api/plants?includeArchived=true");
+  $("#main").innerHTML = `
+    <form class="stack" id="addplant">
+      <strong>Add a plant</strong>
+      <label>Name <input name="name" required maxlength="60" /></label>
+      <label>Location (optional) <input name="location" maxlength="60" placeholder="e.g. Living room" /></label>
+      <label>Water every (days) <input name="intervalDays" type="number" min="1" max="60" value="7" required /></label>
+      <label>Last watered (optional) <input name="lastWateredOn" type="date" max="${state.household.today}" /></label>
+      <button class="primary">Add plant</button>
+    </form>
+    ${plants.map((p) => `
+      <div class="card" style="flex-wrap:wrap">
+        <div class="info">
+          <div class="name">${esc(p.name)} ${p.location ? `<span class="muted">· ${esc(p.location)}</span>` : ""} ${p.archived ? '<span class="tag">Archived</span>' : ""}</div>
+          ${cat(p.category)} ${p.dueStatus ? badge(p.dueStatus.status, p.dueStatus.label) : ""}
+          <div class="muted">Every ${p.intervalDays} day${p.intervalDays === 1 ? "" : "s"} · ${p.lastWatered ? `last watered by ${esc(p.lastWatered.by)}, ${fmtTime(p.lastWatered.at)}` : p.initialLastCaredOn ? `last watered ${p.initialLastCaredOn} (before tracking)` : "no waterings yet"}</div>
+        </div>
+        ${p.archived ? "" : `<button class="primary" data-water="${p.id}" data-latest="${p.latestEventId || ""}" aria-label="Water ${esc(p.name)}">💧 Water</button>`}
+        <div class="row" style="width:100%;margin-top:4px">
+          ${p.archived ? "" : `<button class="secondary" data-earlier="${p.id}" data-name="${esc(p.name)}" data-latest="${p.latestEventId || ""}">Earlier…</button>`}
+          <button class="secondary" data-history="${p.id}">History</button>
+          <button class="secondary" data-interval="${p.id}" data-cur="${p.intervalDays}">Change interval</button>
+          <button class="secondary" data-archive="${p.id}" data-val="${!p.archived}">${p.archived ? "Restore" : "Archive"}</button>
+        </div>
+        <div id="hist-${p.id}" style="width:100%"></div>
+      </div>`).join("")}`;
+  $("#addplant").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target));
+    try { await api("/api/plants", { method: "POST", body: { ...f, intervalDays: Number(f.intervalDays) } }); toast("Plant added"); render(); }
+    catch (err) { toast(err.message, true); }
+  };
+}
+document.addEventListener("click", async (e) => {
+  const a = e.target.closest("[data-archive]");
+  if (a) { try { await api(`/api/plants/${a.dataset.archive}`, { method: "PATCH", body: { archived: a.dataset.val === "true" } }); render(); } catch (err) { toast(err.message, true); } }
+  const iv = e.target.closest("[data-interval]");
+  if (iv) {
+    const v = prompt("Water every how many days? (1–60)", iv.dataset.cur);
+    if (v) { try { await api(`/api/plants/${iv.dataset.interval}`, { method: "PATCH", body: { intervalDays: Number(v) } }); render(); } catch (err) { toast(err.message, true); } }
+  }
+  const h = e.target.closest("[data-history]");
+  if (h) showHistory(h.dataset.history);
+  const u = e.target.closest("[data-undo]");
+  if (u) {
+    if (!state.me) return toast("Pick who you are first (top right).", true);
+    try { await api(`/api/events/${u.dataset.undo}/${u.dataset.action}`, { method: "POST", body: { memberId: state.me } }); render(); } catch (err) { toast(err.message, true); }
+  }
+});
+async function showHistory(plantId) {
+  const events = await api(`/api/plants/${plantId}/events`);
+  const el = document.getElementById("hist-" + plantId);
+  el.innerHTML = events.length ? events.map((ev) => `
+    <div class="card" style="margin:4px 0">
+      <div class="info"><div ${ev.voided ? 'style="text-decoration:line-through"' : ""}>💧 ${esc(ev.performedBy)} · ${fmtTime(ev.performedAt)}</div>
+        <div class="muted">${ev.voided ? '<span class="tag">Undone</span>' : ""}${ev.isBackdated ? '<span class="tag">Backdated</span>' : ""}${ev.isIntentionalExtra ? '<span class="tag">Extra</span>' : ""}${ev.isPossibleDuplicate ? '<span class="tag">Possible duplicate</span>' : ""}
+        ${ev.note ? " · " + esc(ev.note) : ""}
+        ${ev.revisions.map((r) => `<div>${r.action === "void" ? "Undone" : "Restored"} by ${esc(state.household.members.find((m) => m.id === r.memberId)?.name || "someone")} · ${fmtTime(r.at)}</div>`).join("")}</div></div>
+      <button class="secondary" data-undo="${ev.id}" data-action="${ev.voided ? "restore" : "void"}">${ev.voided ? "Restore" : "Undo"}</button>
+    </div>`).join("") : `<div class="empty">No history yet</div>`;
+}
+
+async function renderHome() {
+  const h = state.household;
+  $("#main").innerHTML = `
+    <form class="stack" id="hhform">
+      <strong>Household</strong>
+      <label>Name <input name="name" value="${esc(h.name)}" maxlength="60" required /></label>
+      <label>Time zone <input name="timeZone" value="${esc(h.timeZone)}" required /></label>
+      <button class="primary">Save</button>
+    </form>
+    <h2>Roommates</h2>
+    ${h.members.filter((m) => m.active).map((m) => `<div class="card"><div class="info">${esc(m.name)}${m.id === state.me ? ' <span class="tag">You</span>' : ""}</div><button class="secondary" data-remove="${m.id}">Remove</button></div>`).join("") || '<div class="empty">No roommates yet</div>'}
+    <form class="stack" id="addmember" style="margin-top:8px">
+      <label>Add roommate <input name="name" required maxlength="40" placeholder="Name" /></label>
+      <button class="primary">Add</button>
+    </form>`;
+  $("#hhform").onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api("/api/household", { method: "PATCH", body: Object.fromEntries(new FormData(e.target)) }); toast("Saved"); await loadHousehold(); render(); } catch (err) { toast(err.message, true); }
+  };
+  $("#addmember").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const m = await api("/api/members", { method: "POST", body: Object.fromEntries(new FormData(e.target)) });
+      if (!state.me) { state.me = m.id; localStorage.setItem("pvh.me", m.id); }
+      await loadHousehold(); render();
+    } catch (err) { toast(err.message, true); }
+  };
+  document.querySelectorAll("[data-remove]").forEach((b) => (b.onclick = async () => {
+    if (!confirm("Remove this roommate? Their past waterings stay in history.")) return;
+    await api(`/api/members/${b.dataset.remove}`, { method: "DELETE" }); await loadHousehold(); render();
+  }));
+}
+
+async function render() {
+  document.querySelectorAll("nav button").forEach((b) => b.setAttribute("aria-current", b.dataset.tab === state.tab ? "page" : "false"));
+  try {
+    if (!state.household) await loadHousehold();
+    if (state.tab === "week") await renderWeek();
+    else if (state.tab === "plants") await renderPlants();
+    else await renderHome();
+  } catch (err) { toast(err.message, true); }
+}
+document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { state.tab = b.dataset.tab; render(); }));
+
+// ---------------------------------------------------------------- live updates
+const es = new EventSource("/api/stream");
+let pending;
+const refresh = () => { clearTimeout(pending); pending = setTimeout(async () => { await loadHousehold(); if (state.tab !== "plants") render(); }, 150); };
+["care_event.created", "care_event.updated", "plant.created", "plant.updated", "member.joined", "member.left", "household.updated"].forEach((n) =>
+  es.addEventListener(n, (e) => {
+    const d = JSON.parse(e.data);
+    if (n === "care_event.created" && d.actorMemberId !== state.me) toast(`💧 ${d.actorName} watered ${d.plantName}${d.isPossibleDuplicate ? " — possible duplicate, check history" : ""}`);
+    refresh();
+  }));
+es.onopen = () => refresh();
+
+(async () => {
+  await loadHousehold();
+  if (!state.household.members.some((m) => m.active)) state.tab = "home";
+  render();
+})();
+</script>
+</body>
+</html>

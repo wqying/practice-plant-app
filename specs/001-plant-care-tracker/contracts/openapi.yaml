@@ -1,0 +1,854 @@
+openapi: 3.1.0
+info:
+  title: PlantsVSHumans API
+  version: 1.0.0
+  description: |
+    REST contract for the PlantsVSHumans shared plant care tracker (feature 001).
+    - All routes are under /api/v1 and use JSON.
+    - Authentication: session cookie `pvh_session` (HttpOnly), obtained via magic link.
+    - Household-scoped routes act on the caller's single active household ("current").
+    - All timestamps are RFC 3339 UTC. Local dates are YYYY-MM-DD in the household time zone.
+    - Due status is always computed by the server. There is no writable status field.
+servers:
+  - url: /api/v1
+security:
+  - session: []
+
+tags:
+  - { name: auth, description: Sign-in and profile (FR-036) }
+  - { name: households, description: Household, members, invitations (FR-001–FR-005) }
+  - { name: plants, description: Plants and schedules (FR-006–FR-008, FR-016–FR-019) }
+  - { name: care-events, description: Logging, duplicates, audit (FR-009–FR-015, FR-020–FR-022) }
+  - { name: dashboard, description: Weekly view (FR-023–FR-029) }
+  - { name: notifications, description: Daily summary settings (FR-031–FR-034) }
+
+paths:
+  /auth/magic-link:
+    post:
+      tags: [auth]
+      summary: Email a single-use sign-in link
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                redirectTo: { type: string, description: "Relative path to return to, e.g. /join/{token}" }
+      responses:
+        "202": { description: Accepted. The response is always 202, so it does not reveal whether the account exists. }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { description: Rate limited }
+
+  /auth/verify:
+    post:
+      tags: [auth]
+      summary: Exchange a magic-link token for a session cookie
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200":
+          description: Signed in. Sets the `pvh_session` cookie.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: End the current session
+      responses:
+        "204": { description: Signed out }
+
+  /me:
+    get:
+      tags: [auth]
+      summary: Current user and active membership (if any)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+          description: OK
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [auth]
+      summary: Update display name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string, minLength: 1, maxLength: 40 }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /households:
+    post:
+      tags: [households]
+      summary: Create a household; caller becomes its first member (FR-001)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, timeZone]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 60 }
+                timeZone: { type: string, description: IANA zone, example: Europe/London }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Household" }
+        "409": { description: "Caller already has an active household (code: already_in_household)" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /households/current:
+    get:
+      tags: [households]
+      summary: The caller's household with members
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Household" }
+        "404": { description: "No active household (code: no_household)" }
+    patch:
+      tags: [households]
+      summary: Rename or change time zone (FR-005)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1, maxLength: 60 }
+                timeZone: { type: string }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Household" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /households/current/invitations:
+    post:
+      tags: [households]
+      summary: Create a shareable invite link, valid for 7 days (FR-002)
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invitation" }
+
+  /households/current/invitations/{invitationId}:
+    delete:
+      tags: [households]
+      summary: Revoke an invite link
+      parameters: [{ $ref: "#/components/parameters/InvitationId" }]
+      responses:
+        "204": { description: Revoked }
+
+  /invitations/{token}:
+    get:
+      tags: [households]
+      summary: Preview an invitation (household name, member count)
+      security: []
+      parameters: [{ $ref: "#/components/parameters/InviteToken" }]
+      responses:
+        "200":
+          description: Valid invitation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [householdName, memberCount, expiresAt]
+                properties:
+                  householdName: { type: string }
+                  memberCount: { type: integer }
+                  expiresAt: { type: string, format: date-time }
+        "410": { description: "Expired or revoked (code: invitation_invalid)" }
+
+  /invitations/{token}/accept:
+    post:
+      tags: [households]
+      summary: Join the household
+      parameters: [{ $ref: "#/components/parameters/InviteToken" }]
+      responses:
+        "200":
+          description: Joined
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Household" }
+        "409": { description: "Already in a household (code: already_in_household)" }
+        "410": { description: "Expired or revoked (code: invitation_invalid)" }
+
+  /households/current/members/{memberId}:
+    delete:
+      tags: [households]
+      summary: Remove another member (FR-004). Their history is kept.
+      parameters: [{ $ref: "#/components/parameters/MemberId" }]
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /households/current/leave:
+    post:
+      tags: [households]
+      summary: Leave the household (FR-004)
+      responses:
+        "204": { description: Left. Push subscriptions for this membership are deleted. }
+
+  /plants:
+    get:
+      tags: [plants]
+      summary: List plants with computed status
+      parameters:
+        - name: includeArchived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [today, plants]
+                properties:
+                  today: { type: string, format: date }
+                  plants:
+                    type: array
+                    items: { $ref: "#/components/schemas/PlantWithStatus" }
+    post:
+      tags: [plants]
+      summary: Add a plant with its watering schedule (FR-006, FR-007)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, wateringIntervalDays]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 60 }
+                location: { type: string, maxLength: 60 }
+                wateringIntervalDays: { type: integer, minimum: 1, maximum: 60 }
+                lastWateredOn:
+                  type: string
+                  format: date
+                  description: Optional. Must not be after today (household-local).
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlantWithStatus" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /plants/{plantId}:
+    get:
+      tags: [plants]
+      summary: Plant detail with status and basis (FR-018)
+      parameters: [{ $ref: "#/components/parameters/PlantId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlantWithStatus" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [plants]
+      summary: Edit name, location, or interval (FR-008). Status is recomputed immediately.
+      parameters: [{ $ref: "#/components/parameters/PlantId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1, maxLength: 60 }
+                location: { type: [string, "null"], maxLength: 60 }
+                wateringIntervalDays: { type: integer, minimum: 1, maximum: 60 }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlantWithStatus" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /plants/{plantId}/archive:
+    post:
+      tags: [plants]
+      summary: Archive (removes from due lists and summaries; history kept)
+      parameters: [{ $ref: "#/components/parameters/PlantId" }]
+      responses:
+        "200":
+          description: Archived
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlantWithStatus" }
+
+  /plants/{plantId}/restore:
+    post:
+      tags: [plants]
+      summary: Restore an archived plant
+      parameters: [{ $ref: "#/components/parameters/PlantId" }]
+      responses:
+        "200":
+          description: Restored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlantWithStatus" }
+
+  /plants/{plantId}/care-events:
+    get:
+      tags: [care-events]
+      summary: Plant care history, newest first, including voided events
+      parameters:
+        - { $ref: "#/components/parameters/PlantId" }
+        - name: before
+          in: query
+          description: Cursor (performedAt of the last item seen)
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/CareEvent" }
+                  nextBefore: { type: [string, "null"], format: date-time }
+    post:
+      tags: [care-events]
+      summary: Log a completed care activity (FR-009–FR-012, FR-020–FR-022)
+      description: |
+        The performer and `recordedAt` always come from the session and server clock.
+        Duplicate handling (research R-4), checked under a per-plant lock:
+        - A non-voided event of the same category within the duplicate window that is
+          already known to the client (it is `knownLatestEventId`, or older), with
+          `confirmDuplicate` not true → **409 duplicate_warning**. Nothing is saved.
+        - Such an event exists but the client did not know about it (a race) → **201**.
+          The event is saved with `isPossibleDuplicate=true`.
+        - `confirmDuplicate=true` → **201** with `isIntentionalExtra=true`.
+        - A repeated `clientRequestId` from the same member → **200** with the original
+          event (idempotent replay).
+      parameters: [{ $ref: "#/components/parameters/PlantId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category, clientRequestId]
+              properties:
+                category: { type: string, enum: [watering] }
+                clientRequestId: { type: string, format: uuid }
+                performedAt:
+                  type: string
+                  format: date-time
+                  description: Optional backdate. Must not be in the future. When present, the event is marked backdated.
+                note: { type: string, maxLength: 280 }
+                knownLatestEventId:
+                  type: [string, "null"]
+                  format: uuid
+                  description: Latest event id the client was displaying for this plant and category.
+                confirmDuplicate: { type: boolean, default: false }
+      responses:
+        "201":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CareEventCreated" }
+        "200":
+          description: Idempotent replay of an already-saved request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CareEventCreated" }
+        "409":
+          description: Duplicate warning. Nothing was saved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DuplicateWarning" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /care-events/{eventId}:
+    patch:
+      tags: [care-events]
+      summary: Edit performedAt and/or note (audited, FR-013)
+      parameters: [{ $ref: "#/components/parameters/EventId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedRevision]
+              properties:
+                expectedRevision: { type: integer, minimum: 1 }
+                performedAt: { type: string, format: date-time }
+                note: { type: [string, "null"], maxLength: 280 }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CareEvent" }
+        "409": { description: "Revision conflict (code: revision_conflict). Refetch and retry." }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /care-events/{eventId}/void:
+    post:
+      tags: [care-events]
+      summary: Undo an event (it stays in history, marked undone)
+      parameters: [{ $ref: "#/components/parameters/EventId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedRevision]
+              properties:
+                expectedRevision: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Voided
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CareEvent" }
+        "409": { description: "Revision conflict or already voided" }
+
+  /care-events/{eventId}/restore:
+    post:
+      tags: [care-events]
+      summary: Reverse an undo
+      parameters: [{ $ref: "#/components/parameters/EventId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedRevision]
+              properties:
+                expectedRevision: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Restored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CareEvent" }
+        "409": { description: "Revision conflict or not voided" }
+
+  /care-events/{eventId}/revisions:
+    get:
+      tags: [care-events]
+      summary: Audit trail for an event (FR-013)
+      parameters: [{ $ref: "#/components/parameters/EventId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CareEventRevision" }
+
+  /dashboard:
+    get:
+      tags: [dashboard]
+      summary: Monday–Sunday weekly view (FR-023–FR-026, FR-029)
+      parameters:
+        - name: weekStart
+          in: query
+          description: Monday (household-local). Defaults to the current week. A non-Monday date returns 422.
+          schema: { type: string, format: date }
+        - name: memberId
+          in: query
+          description: Filter completed items by performer. Due and overdue items are unaffected (shared pool, FR-030).
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dashboard" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /me/notification-preferences:
+    get:
+      tags: [notifications]
+      summary: Daily summary settings
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+    put:
+      tags: [notifications]
+      summary: Turn the daily summary on or off and set its time (FR-032)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationPreferences" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /me/push-subscriptions:
+    post:
+      tags: [notifications]
+      summary: Register this device's Web Push subscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint, keys]
+              properties:
+                endpoint: { type: string, format: uri }
+                keys:
+                  type: object
+                  required: [p256dh, auth]
+                  properties:
+                    p256dh: { type: string }
+                    auth: { type: string }
+      responses:
+        "201":
+          description: Registered (upsert by endpoint)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { type: string, format: uuid }
+
+  /me/push-subscriptions/{subscriptionId}:
+    delete:
+      tags: [notifications]
+      summary: Unregister a device
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Removed }
+
+  /push/vapid-public-key:
+    get:
+      tags: [notifications]
+      summary: Public VAPID key for subscribing
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [publicKey]
+                properties:
+                  publicKey: { type: string }
+
+  /households/current/stream:
+    get:
+      tags: [households]
+      summary: Server-Sent Events stream of household changes (FR-014)
+      description: See contracts/realtime-and-push.md for event names and payloads.
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: pvh_session
+
+  parameters:
+    PlantId: { name: plantId, in: path, required: true, schema: { type: string, format: uuid } }
+    EventId: { name: eventId, in: path, required: true, schema: { type: string, format: uuid } }
+    MemberId: { name: memberId, in: path, required: true, schema: { type: string, format: uuid } }
+    InvitationId: { name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }
+    InviteToken: { name: token, in: path, required: true, schema: { type: string } }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: "Validation failed (code: validation_error)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Not signed in
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found, or not in the caller's household (FR-035)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string, description: User-presentable message }
+        fields:
+          type: object
+          additionalProperties: { type: string }
+
+    Me:
+      type: object
+      required: [userId, email, displayName]
+      properties:
+        userId: { type: string, format: uuid }
+        email: { type: string, format: email }
+        displayName: { type: string }
+        memberId: { type: [string, "null"], format: uuid }
+        householdId: { type: [string, "null"], format: uuid }
+
+    Member:
+      type: object
+      required: [memberId, displayName, joinedAt, active]
+      properties:
+        memberId: { type: string, format: uuid }
+        displayName: { type: string }
+        joinedAt: { type: string, format: date-time }
+        active: { type: boolean }
+
+    Household:
+      type: object
+      required: [id, name, timeZone, weekStart, members]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        timeZone: { type: string }
+        weekStart: { type: string, enum: [monday] }
+        members:
+          type: array
+          items: { $ref: "#/components/schemas/Member" }
+
+    Invitation:
+      type: object
+      required: [id, url, expiresAt]
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        expiresAt: { type: string, format: date-time }
+
+    Category:
+      type: object
+      required: [code, label, icon]
+      properties:
+        code: { type: string, enum: [watering] }
+        label: { type: string, example: Watering }
+        icon: { type: string, example: droplet }
+
+    DueStatus:
+      type: object
+      description: Computed server-side (Principle III). Traceable via `basis` (FR-018).
+      required: [status, label, dueDate, basis]
+      properties:
+        status: { type: string, enum: [overdue, due_today, upcoming] }
+        label: { type: string, example: "Overdue by 2 days" }
+        dueDate: { type: string, format: date }
+        daysOverdue: { type: integer, minimum: 1 }
+        daysUntilDue: { type: integer, minimum: 1 }
+        basis:
+          type: object
+          required: [intervalDays, source]
+          properties:
+            intervalDays: { type: integer }
+            source: { type: string, enum: [latest_event, initial_last_watered, created_on] }
+            eventId: { type: [string, "null"], format: uuid }
+            performedAt: { type: [string, "null"], format: date-time }
+            performedBy: { type: [string, "null"], description: Display name }
+            baseDate: { type: string, format: date, description: The local date the interval was counted from }
+
+    PlantWithStatus:
+      type: object
+      required: [id, name, archived, schedules]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        location: { type: [string, "null"] }
+        archived: { type: boolean }
+        schedules:
+          type: array
+          items:
+            type: object
+            required: [category, intervalDays]
+            properties:
+              category: { $ref: "#/components/schemas/Category" }
+              intervalDays: { type: integer, minimum: 1, maximum: 60 }
+              latestEventId: { type: [string, "null"], format: uuid, description: Send as knownLatestEventId when logging }
+              dueStatus:
+                description: Omitted when the plant is archived
+                $ref: "#/components/schemas/DueStatus"
+
+    CareEvent:
+      type: object
+      required: [id, plantId, category, performedBy, performedAt, recordedAt, isBackdated, isIntentionalExtra, isPossibleDuplicate, voided, revision]
+      properties:
+        id: { type: string, format: uuid }
+        plantId: { type: string, format: uuid }
+        category: { $ref: "#/components/schemas/Category" }
+        performedBy: { $ref: "#/components/schemas/Member" }
+        performedAt: { type: string, format: date-time }
+        recordedAt: { type: string, format: date-time }
+        isBackdated: { type: boolean }
+        isIntentionalExtra: { type: boolean }
+        isPossibleDuplicate: { type: boolean }
+        duplicateOfEventId: { type: [string, "null"], format: uuid }
+        note: { type: [string, "null"] }
+        voided: { type: boolean }
+        revision: { type: integer }
+
+    CareEventCreated:
+      type: object
+      required: [event, plant]
+      properties:
+        event: { $ref: "#/components/schemas/CareEvent" }
+        plant: { $ref: "#/components/schemas/PlantWithStatus" }
+
+    DuplicateWarning:
+      type: object
+      required: [code, message, existingEvent, windowHours]
+      properties:
+        code: { type: string, const: duplicate_warning }
+        message: { type: string, example: "Alex watered Fern 3 hours ago — log anyway?" }
+        existingEvent: { $ref: "#/components/schemas/CareEvent" }
+        windowHours: { type: number }
+
+    CareEventRevision:
+      type: object
+      required: [revision, action, changedBy, changedAt, before, after]
+      properties:
+        revision: { type: integer }
+        action: { type: string, enum: [edit, void, restore] }
+        changedBy: { $ref: "#/components/schemas/Member" }
+        changedAt: { type: string, format: date-time }
+        before: { type: object }
+        after: { type: object }
+
+    DashboardItem:
+      type: object
+      required: [kind, plantId, plantName, category, statusLabel]
+      properties:
+        kind: { type: string, enum: [completed, overdue, due_today, upcoming] }
+        plantId: { type: string, format: uuid }
+        plantName: { type: string }
+        plantLocation: { type: [string, "null"] }
+        category: { $ref: "#/components/schemas/Category" }
+        statusLabel: { type: string, description: "Text label so status does not rely on color (FR-027), e.g. Done, Due today, Overdue by 2 days" }
+        latestEventId: { type: [string, "null"], format: uuid, description: For due/overdue items; send as knownLatestEventId }
+        event:
+          description: Present when kind = completed
+          $ref: "#/components/schemas/CareEvent"
+        dueDate: { type: string, format: date }
+        projected: { type: boolean, description: True for future due dates beyond the next one }
+
+    Dashboard:
+      type: object
+      required: [today, weekStart, weekEnd, timeZone, overdue, days, members]
+      properties:
+        today: { type: string, format: date }
+        weekStart: { type: string, format: date }
+        weekEnd: { type: string, format: date }
+        timeZone: { type: string }
+        overdue:
+          type: array
+          description: Listed first (FR-024). Empty unless the requested week contains today.
+          items: { $ref: "#/components/schemas/DashboardItem" }
+        days:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            type: object
+            required: [date, items]
+            properties:
+              date: { type: string, format: date }
+              items:
+                type: array
+                items: { $ref: "#/components/schemas/DashboardItem" }
+        members:
+          type: array
+          description: For the member filter (FR-029)
+          items: { $ref: "#/components/schemas/Member" }
+        categories:
+          type: array
+          description: The category filter is shown by the client only when length > 1
+          items: { $ref: "#/components/schemas/Category" }
+
+    NotificationPreferences:
+      type: object
+      required: [dailySummaryEnabled, deliveryTime]
+      properties:
+        dailySummaryEnabled: { type: boolean }
+        deliveryTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: HH:mm in the household time zone. Default 08:00.
+        hasPushSubscription: { type: boolean, readOnly: true }
